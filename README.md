@@ -215,7 +215,7 @@ The profile collector provides comprehensive MongoDB slow query metrics from the
 
 *Labels:*
 - `database` - Database name
-- `namespace` - Full namespace (database.collection)
+- `ns` - MongoDB namespace (database.collection)
 - `query_hash` - MongoDB query hash identifier
 - `query_shape` - Normalized query shape (sanitized for security)
 - `query_framework` - Query execution framework (classic, sbe)
@@ -257,6 +257,102 @@ mongodb_exporter --collector.profile --collector.profile-max-string-size=500
 mongodb_exporter --collector.profile --collector.profile-time-ts=60 \
   --collector.profile-max-string-size=2000 --mongodb.uri=mongodb://user:pass@localhost:27017
 ```
+
+#### Testing and Simulation
+
+To test the enhanced profile collector and verify metrics are being generated:
+
+**1. Enable MongoDB Profiling:**
+```bash
+# Connect to your MongoDB instance
+mongosh mongodb://your-connection-string
+
+# Enable profiling for slow operations (adjust slowms as needed)
+db.setProfilingLevel(1, { slowms: 50 })
+
+# Verify profiling is enabled
+db.getProfilingStatus()
+```
+
+**2. Generate Test Slow Queries:**
+```javascript
+// Create a test collection
+use testdb
+db.testcoll.drop()
+
+// Insert some test data
+for (let i = 0; i < 1000; i++) {
+  db.testcoll.insertOne({
+    name: "user" + i,
+    email: "user" + i + "@example.com",
+    age: Math.floor(Math.random() * 80) + 18,
+    created: new Date()
+  })
+}
+
+// Create an index to see different query patterns
+db.testcoll.createIndex({email: 1})
+
+// Generate slow queries (these should appear in profiler)
+// 1. Collection scan (slow)
+db.testcoll.find({name: /user1.*/}).limit(5)
+
+// 2. Non-indexed field query (slow)
+db.testcoll.find({age: {$gt: 50}}).limit(10)
+
+// 3. Update operation
+db.testcoll.updateMany({age: {$lt: 25}}, {$set: {status: "young"}})
+
+// 4. Aggregation pipeline
+db.testcoll.aggregate([
+  {$match: {age: {$gte: 30}}},
+  {$group: {_id: "$age", count: {$sum: 1}}},
+  {$sort: {count: -1}}
+])
+
+// 5. Delete operation
+db.testcoll.deleteMany({age: {$gt: 75}})
+```
+
+**3. Verify Profile Data:**
+```javascript
+// Check profile collection has data
+db.system.profile.countDocuments({})
+
+// View recent profile entries
+db.system.profile.find().sort({ts: -1}).limit(5).pretty()
+
+// Check for specific operation types
+db.system.profile.find({op: "query"}).limit(3)
+```
+
+**4. Check Exporter Metrics:**
+```bash
+# Wait 30-60 seconds after generating queries, then check metrics
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries"
+
+# Count different metric types
+echo "Enhanced metrics:"
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_count_total" | wc -l
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_duration_total" | wc -l
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_info" | wc -l
+
+# View specific metrics with labels
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_info" | head -3
+```
+
+**5. Expected Output Example:**
+```
+mongodb_profile_slow_queries_count_total{database="testdb",ns="testdb.testcoll",op_type="query",query_framework="classic"} 3
+mongodb_profile_slow_queries_duration_total{database="testdb",ns="testdb.testcoll",op_type="query",query_framework="classic"} 156
+mongodb_profile_slow_queries_info{database="testdb",ns="testdb.testcoll",query_shape="{find: ?, filter: {age: {$gt: ?}}}",op_type="query"} 1
+```
+
+**Troubleshooting:**
+- If no metrics appear, ensure `ProfileTimeTS` window (default 30s) covers your query time
+- Lower `slowms` threshold: `db.setProfilingLevel(1, { slowms: 10 })`
+- Check profile collection: `db.system.profile.find().count()`
+- Increase time window: `--collector.profile-time-ts=300`
 
 **Note:** The enhanced profile collector maintains backward compatibility with the original `mongodb_profile_slow_query_count` metric while providing detailed query performance insights.
 

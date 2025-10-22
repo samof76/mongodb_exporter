@@ -256,7 +256,7 @@ func (d *profileCollector) createQuerySignature(doc profileDocument, database st
 func (d *profileCollector) createLabels(doc profileDocument, database, collection string) map[string]string {
 	labels := d.topologyInfo.baseLabels()
 	labels["database"] = database
-	labels["namespace"] = doc.NS
+	labels["ns"] = doc.NS
 	labels["op_type"] = doc.Op
 
 	if doc.QueryHash != "" {
