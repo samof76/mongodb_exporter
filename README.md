@@ -160,15 +160,72 @@ HELP mongodb_mongod_wiredtiger_log_bytes_total mongodb_mongod_wiredtiger_log_byt
 mongodb_mongod_wiredtiger_log_bytes_total{type="unwritten"} 2.6208e+06
 ```
 #### Enabling profile metrics gathering
-`--collector.profile` 
+`--collector.profile`
+
+The profile collector provides comprehensive MongoDB slow query metrics from the `system.profile` collection, including query shapes, execution times, and performance statistics.
+
+**Configuration Options:**
+- `--collector.profile-time-ts` - Time window in seconds for scraping slow queries (default: 30)
+- `--collector.profile-max-string-size` - Maximum string size for query labels (default: 1000)
+
+**Exported Metrics:**
+
+*Counter Metrics:*
+- `mongodb_profile_slow_queries_count_total` - Total number of slow queries by query shape
+- `mongodb_profile_slow_queries_duration_total` - Total execution time in milliseconds
+- `mongodb_profile_slow_queries_keys_examined_total` - Total keys examined
+- `mongodb_profile_slow_queries_docs_examined_total` - Total documents examined
+- `mongodb_profile_slow_queries_nreturned_total` - Total documents returned
+
+*Gauge Metrics:*
+- `mongodb_profile_slow_queries_info` - Query metadata information (always 1)
+
+*Labels:*
+- `database` - Database name
+- `namespace` - Full namespace (database.collection)
+- `query_hash` - MongoDB query hash identifier
+- `query_shape` - Normalized query shape (sanitized for security)
+- `query_framework` - Query execution framework (classic, sbe)
+- `op_type` - Operation type (query, insert, update, delete)
+- `plan_summary` - Query execution plan summary
+
+**MongoDB Profiler Setup:**
 To collect metrics, you need to enable the profiler in [MongoDB](https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/):
-Usage example: `db.setProfilingLevel(2)`
+
+```bash
+# Enable profiler for slow operations (>100ms)
+db.setProfilingLevel(1, { slowms: 100 })
+
+# Enable profiler for all operations
+db.setProfilingLevel(2)
+
+# Increase profile collection size (recommended for production)
+db.setProfilingLevel(0)
+db.system.profile.drop()
+db.createCollection("system.profile", { capped: true, size: 52428800 }) // 50MB
+db.setProfilingLevel(1, { slowms: 100 })
+```
 
 |Level|Description|
 |-----|-----------|
 |0| The profiler is off and does not collect any data. This is the default profiler level.|
 |1| The profiler collects data for operations that take longer than the value of `slowms` or that match a filter.<br> When a filter is set: <ul><li> The `slowms` and `sampleRate` options are not used for profiling.</li><li>The profiler only captures operations that match the filter.</li></ul>
 |2|The profiler collects data for all operations.|
+
+**Usage Examples:**
+```bash
+# Enable enhanced profile collector with default settings
+mongodb_exporter --collector.profile --collector.profile-time-ts=30
+
+# With custom string size limits
+mongodb_exporter --collector.profile --collector.profile-max-string-size=500
+
+# Comprehensive monitoring setup
+mongodb_exporter --collector.profile --collector.profile-time-ts=60 \
+  --collector.profile-max-string-size=2000 --mongodb.uri=mongodb://user:pass@localhost:27017
+```
+
+**Note:** The enhanced profile collector maintains backward compatibility with the original `mongodb_profile_slow_query_count` metric while providing detailed query performance insights.
 
 #### Enabling shards metrics gathering
 When shard metrics collection is enabled by `--collector.shards`, the exporter will expose metrics related to sharded Mongo. 

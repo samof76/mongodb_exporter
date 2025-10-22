@@ -25,6 +25,7 @@ import (
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	"github.com/percona/mongodb_exporter/internal/tu"
 )
@@ -49,7 +50,7 @@ func TestProfileCollector(t *testing.T) {
 
 	ti := labelsGetterMock{}
 
-	c := newProfileCollector(ctx, client, promslog.New(&promslog.Config{}), false, ti, 30)
+	c := newProfileCollector(ctx, client, promslog.New(&promslog.Config{}), false, ti, 30, 1000)
 
 	expected := strings.NewReader(`
 	# HELP mongodb_profile_slow_query_count profile_slow_query.count
@@ -62,8 +63,73 @@ func TestProfileCollector(t *testing.T) {
 
 	filter := []string{
 		"mongodb_profile_slow_query_count",
+		"mongodb_profile_slow_queries_count_total",
+		"mongodb_profile_slow_queries_duration_total",
+		"mongodb_profile_slow_queries_keys_examined_total",
+		"mongodb_profile_slow_queries_docs_examined_total",
+		"mongodb_profile_slow_queries_nreturned_total",
+		"mongodb_profile_slow_queries_info",
 	}
 
 	err := testutil.CollectAndCompare(c, expected, filter...)
 	assert.NoError(t, err)
+}
+
+func TestProfileCollectorQueryNormalization(t *testing.T) {
+	ctx := context.Background()
+
+	ti := labelsGetterMock{}
+	c := newProfileCollector(ctx, nil, promslog.New(&promslog.Config{}), false, ti, 30, 100)
+
+	// Test query normalization
+	testCases := []struct {
+		name     string
+		input    primitive.M
+		expected string
+	}{
+		{
+			name: "simple find query",
+			input: primitive.M{
+				"find":   "users",
+				"filter": primitive.M{"name": "John", "age": 25},
+			},
+			expected: "{find: ?, filter: {name: ?, age: ?}}",
+		},
+		{
+			name: "nested query",
+			input: primitive.M{
+				"find":   "users",
+				"filter": primitive.M{"address": primitive.M{"city": "NYC"}},
+			},
+			expected: "{find: ?, filter: {address: {city: ?}}}",
+		},
+		{
+			name: "array query",
+			input: primitive.M{
+				"find":   "users",
+				"filter": primitive.M{"tags": primitive.A{"tag1", "tag2"}},
+			},
+			expected: "{find: ?, filter: {tags: [?, ?]}}",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := c.normalizeQueryShape(tc.input)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestProfileCollectorStringTruncation(t *testing.T) {
+	ctx := context.Background()
+
+	ti := labelsGetterMock{}
+	c := newProfileCollector(ctx, nil, promslog.New(&promslog.Config{}), false, ti, 30, 10)
+
+	longString := "this is a very long string that should be truncated"
+	result := c.truncateString(longString, 10)
+
+	assert.Equal(t, "this is...", result)
+	assert.LessOrEqual(t, len(result), 10)
 }

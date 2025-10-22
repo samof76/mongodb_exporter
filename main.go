@@ -75,7 +75,8 @@ type GlobalFlags struct {
 	CollStatsLimit         int  `name:"collector.collstats-limit" help:"Disable collstats, dbstats, topmetrics and indexstats collector if there are more than <n> collections. 0=No limit" default:"0"`
 	CollStatsEnableDetails bool `name:"collector.collstats-enable-details" help:"Enable collecting index details and wired tiger metrics from $collStats" default:"false"`
 
-	ProfileTimeTS int `name:"collector.profile-time-ts" help:"Set time for scrape slow queries." default:"30"`
+	ProfileTimeTS        int `name:"collector.profile-time-ts" help:"Set time for scrape slow queries." default:"30"`
+	ProfileMaxStringSize int `name:"collector.profile-max-string-size" help:"Maximum string size for profile query labels" default:"1000"`
 
 	CurrentOpSlowTime string `name:"collector.currentopmetrics-slow-time" help:"Set minimum time for registration queries." default:"1m"`
 
@@ -194,6 +195,7 @@ func buildExporter(opts GlobalFlags, uri string, log *slog.Logger) *exporter.Exp
 		CollStatsEnableDetails: opts.CollStatsEnableDetails,
 		CollectAll:             opts.CollectAll,
 		ProfileTimeTS:          opts.ProfileTimeTS,
+		ProfileMaxStringSize:   opts.ProfileMaxStringSize,
 		CurrentOpSlowTime:      opts.CurrentOpSlowTime,
 	}
 

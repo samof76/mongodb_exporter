@@ -79,6 +79,7 @@ type Opts struct {
 	IndexStatsCollections  []string
 	CurrentOpSlowTime      string
 	ProfileTimeTS          int
+	ProfileMaxStringSize   int
 
 	Logger *slog.Logger
 
@@ -226,7 +227,7 @@ func (e *Exporter) makeRegistry(ctx context.Context, client *mongo.Client, topol
 
 	if e.opts.EnableProfile && nodeType != typeMongos && limitsOk && requestOpts.EnableProfile && e.opts.ProfileTimeTS != 0 {
 		pc := newProfileCollector(ctx, client, e.opts.Logger,
-			e.opts.CompatibleMode, topologyInfo, e.opts.ProfileTimeTS)
+			e.opts.CompatibleMode, topologyInfo, e.opts.ProfileTimeTS, e.opts.ProfileMaxStringSize)
 		registry.MustRegister(pc)
 	}
 
