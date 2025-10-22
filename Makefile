@@ -1,4 +1,4 @@
-.PHONY: all build clean default help init test format check-license release-dry-run
+.PHONY: all build clean default help init test format check-license release-dry-run docker-build-multi publish
 default: help
 
 GO_TEST_PATH ?= ./...
@@ -15,6 +15,8 @@ PMM_RELEASE_FULLCOMMIT ?= $(shell git rev-parse HEAD)
 GO_BUILD_LDFLAGS = -X main.version=${COMPONENT_VERSION} -X main.buildDate=${BUILD_DATE} -X main.commit=${PMM_RELEASE_FULLCOMMIT} -X main.Branch=${COMPONENT_BRANCH} -X main.GoVersion=${GOVERSION} -s -w
 NAME ?= mongodb_exporter
 REPO ?= percona/$(NAME)
+DOCKER_REPO ?= $(REPO)
+GIT_SHA ?= $(shell git rev-parse --short=7 HEAD)
 GORELEASER_FLAGS ?=
 UID ?= $(shell id -u)
 
@@ -76,6 +78,31 @@ build:                      ## Build exporter binary using plain go build.
 
 docker-build: build
 	docker build -t ${NAME}:${IMAGE_TAG} .
+
+docker-build-multi:            ## Build multi-architecture Docker image locally
+	docker buildx build --platform linux/amd64,linux/arm64 \
+		--build-arg BUILD_DATE="$(BUILD_DATE)" \
+		--build-arg COMPONENT_VERSION="$(COMPONENT_VERSION)" \
+		--build-arg PMM_RELEASE_FULLCOMMIT="$(PMM_RELEASE_FULLCOMMIT)" \
+		--build-arg COMPONENT_BRANCH="$(COMPONENT_BRANCH)" \
+		--build-arg GOVERSION="$(GOVERSION)" \
+		-f Dockerfile.multi \
+		-t $(DOCKER_REPO):$(GIT_SHA) \
+		.
+
+publish:                       ## Build and push multi-architecture Docker image with git SHA tag
+	@echo "Building and pushing multi-architecture image: $(DOCKER_REPO):$(GIT_SHA)"
+	@echo "Platforms: linux/amd64,linux/arm64"
+	docker buildx build --platform linux/amd64,linux/arm64 \
+		--build-arg BUILD_DATE="$(BUILD_DATE)" \
+		--build-arg COMPONENT_VERSION="$(COMPONENT_VERSION)" \
+		--build-arg PMM_RELEASE_FULLCOMMIT="$(PMM_RELEASE_FULLCOMMIT)" \
+		--build-arg COMPONENT_BRANCH="$(COMPONENT_BRANCH)" \
+		--build-arg GOVERSION="$(GOVERSION)" \
+		-f Dockerfile.multi \
+		-t $(DOCKER_REPO):$(GIT_SHA) \
+		--push \
+		.
 
 build-gssapi:                      ## Build exporter binary with GSSAPI support (requires CGO enabled).
 	CGO_ENABLED=1 go build -ldflags="$(GO_BUILD_LDFLAGS)" -tags gssapi  -o $(PMM_RELEASE_PATH)/mongodb_exporter

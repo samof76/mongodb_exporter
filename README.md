@@ -61,6 +61,39 @@ podman run -d -p 9216:9216 percona/mongodb_exporter:0.40 --mongodb.uri=mongodb:/
 docker run -d -p 9216:9216 percona/mongodb_exporter:0.40 --mongodb.uri=mongodb://127.0.0.1:17001
 ```
 
+#### Multi-Architecture Docker Build
+
+The project includes `Dockerfile.multi` for building multi-architecture Docker images supporting both `linux/amd64` and `linux/arm64` platforms.
+
+**Building locally:**
+```sh
+# Build multi-architecture image locally (requires Docker Buildx)
+make docker-build-multi
+```
+
+**Publishing to registry:**
+```sh
+# Publish to default repository with git SHA tag
+make publish
+
+# Publish to custom repository
+DOCKER_REPO=your-registry/mongodb_exporter make publish
+
+# Example with AWS ECR
+DOCKER_REPO=123456789.dkr.ecr.us-east-1.amazonaws.com/mongodb_exporter make publish
+```
+
+The `publish` target automatically:
+- Builds for both `linux/amd64` and `linux/arm64` architectures
+- Tags the image with a 7-character git SHA (e.g., `a1b2c3d`)
+- Pushes the multi-architecture manifest to the configured repository
+- Includes proper build metadata (version, commit, build date)
+
+**Prerequisites:**
+- Docker Buildx installed and configured
+- Access to the target Docker registry
+- `docker login` completed for the target registry
+
 ### Permissions
 Connecting user should have sufficient rights to query needed stats:
 
