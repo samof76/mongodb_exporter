@@ -45,6 +45,67 @@ Just run `make release` and the new binaries will be generated under the build d
 │ └── mongodb_exporter_linux_amd64
 │ └── mongodb_exporter <--- Linux binary
 ```
+
+### Development and Testing
+
+#### Running Tests
+
+The project includes comprehensive unit tests for all components. Tests are designed to run without requiring a live MongoDB connection for most functionality.
+
+**Run all tests:**
+```bash
+go test ./...
+```
+
+**Run tests with verbose output:**
+```bash
+go test -v ./...
+```
+
+**Run specific test packages:**
+```bash
+# Test only the exporter package
+go test ./exporter
+
+# Test only the profile collector
+go test ./exporter -run TestProfile
+```
+
+**Run tests with coverage:**
+```bash
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+```
+
+#### Test Structure
+
+- **Unit Tests**: Most tests run without external dependencies and focus on logic validation
+- **Integration Tests**: Some tests require Docker containers with MongoDB instances
+- **Profile Collector Tests**: Comprehensive tests for flag combinations, URL filtering behavior, and defensive registration
+
+**Key Test Areas:**
+- `TestGetRequestOpts`: Tests URL parameter filtering and configuration preservation
+- `TestCollectAllFlag`: Tests collector registration conditions and flag behavior  
+- `TestProfileCollector*`: Tests profile collector functionality and edge cases
+
+#### URL Parameter Testing
+
+The enhanced profile collector supports URL parameters for selective metric collection. The `GetRequestOpts` function now properly preserves configuration settings while enabling only requested collectors:
+
+```bash
+# Enable only profile collector via URL
+curl "http://localhost:9216/metrics?collect[]=profile"
+
+# Enable multiple collectors
+curl "http://localhost:9216/metrics?collect[]=profile&collect[]=dbstats"
+```
+
+**Configuration Preservation**: When using URL filters, settings like `ProfileTimeTS` and `ProfileMaxStringSize` are preserved from the default configuration, ensuring consistent behavior across different access methods.
+
+#### Defensive Registration
+
+The profile collector includes defensive registration logic to prevent panics when conflicting command-line flags are used (e.g., `--collect-all` with `--collector.profile`). The system logs warnings instead of crashing and continues operation.
+
 ### Running the exporter
 If you built the exporter using the method mentioned in the previous section, the generated binaries are in `mongodb_exporter_linux_amd64/mongodb_exporter` or `mongodb_exporter_darwin_amd64/mongodb_exporter`
 
@@ -256,7 +317,12 @@ mongodb_exporter --collector.profile --collector.profile-max-string-size=500
 # Comprehensive monitoring setup
 mongodb_exporter --collector.profile --collector.profile-time-ts=60 \
   --collector.profile-max-string-size=2000 --mongodb.uri=mongodb://user:pass@localhost:27017
+
+# Enable all collectors (including profile) - recommended for full monitoring
+mongodb_exporter --collect-all --mongodb.uri=mongodb://user:pass@localhost:27017
 ```
+
+**Important:** Do not combine `--collect-all` with `--collector.profile` as this can cause conflicts. Use either `--collect-all` (which includes profile collector) OR specific collector flags like `--collector.profile`.
 
 #### Testing and Simulation
 
