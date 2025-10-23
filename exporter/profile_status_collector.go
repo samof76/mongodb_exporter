@@ -17,10 +17,9 @@ package exporter
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,354 +29,489 @@ import (
 )
 
 type profileCollector struct {
-	ctx            context.Context
-	base           *baseCollector
-	compatibleMode bool
-	topologyInfo   labelsGetter
-	profiletimets  int
-	maxStringSize  int
+	ctx               context.Context
+	base              *baseCollector
+	compatibleMode    bool
+	topologyInfo      labelsGetter
+	profiletimets     int
+	maxStringSize     int
+	lastInfoClear     time.Time
+	infoClearInterval time.Duration
+	mutex             sync.RWMutex
 }
+
+// Prometheus metrics matching the Python implementation exactly
+var (
+	slowQueriesCountTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mongodb",
+			Subsystem: "profile",
+			Name:      "slow_queries_count_total",
+			Help:      "Total number of slow queries",
+		},
+		[]string{"db", "ns", "query_hash"},
+	)
+
+	slowQueriesInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "mongodb",
+			Subsystem: "profile",
+			Name:      "slow_queries_info",
+			Help:      "Information about slow query",
+		},
+		[]string{"db", "ns", "query_hash", "query_shape", "query_framework", "op", "plan_summary"},
+	)
+
+	slowQueriesDurationTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mongodb",
+			Subsystem: "profile",
+			Name:      "slow_queries_duration_total",
+			Help:      "Total execution time of slow queries in milliseconds",
+		},
+		[]string{"db", "ns", "query_hash"},
+	)
+
+	slowQueriesKeysExaminedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mongodb",
+			Subsystem: "profile",
+			Name:      "slow_queries_keys_examined_total",
+			Help:      "Total number of examined keys",
+		},
+		[]string{"db", "ns", "query_hash"},
+	)
+
+	slowQueriesDocsExaminedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mongodb",
+			Subsystem: "profile",
+			Name:      "slow_queries_docs_examined_total",
+			Help:      "Total number of examined documents",
+		},
+		[]string{"db", "ns", "query_hash"},
+	)
+
+	slowQueriesNreturnedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mongodb",
+			Subsystem: "profile",
+			Name:      "slow_queries_nreturned_total",
+			Help:      "Total number of returned documents",
+		},
+		[]string{"db", "ns", "query_hash"},
+	)
+)
+
+// Keys to remove from query for normalization (matching Python implementation)
+var keysToRemove = []string{"cursor", "lsid", "projection", "limit", "signature", "$readPreference", "$db", "$clusterTime"}
 
 // newProfileCollector creates a collector for being processed queries.
 func newProfileCollector(ctx context.Context, client *mongo.Client, logger *slog.Logger,
 	compatible bool, topology labelsGetter, profileTimeTS int, maxStringSize int,
 ) *profileCollector {
 	return &profileCollector{
-		ctx:            ctx,
-		base:           newBaseCollector(client, logger.With("collector", "profile")),
-		compatibleMode: compatible,
-		topologyInfo:   topology,
-		profiletimets:  profileTimeTS,
-		maxStringSize:  maxStringSize,
+		ctx:               ctx,
+		base:              newBaseCollector(client, logger.With("collector", "profile")),
+		compatibleMode:    compatible,
+		topologyInfo:      topology,
+		profiletimets:     profileTimeTS,
+		maxStringSize:     maxStringSize,
+		lastInfoClear:     time.Now(),
+		infoClearInterval: 300 * time.Second, // 300 seconds like Python implementation
 	}
 }
 
 func (d *profileCollector) Describe(ch chan<- *prometheus.Desc) {
-	d.base.Describe(d.ctx, ch, d.collect)
+	slowQueriesCountTotal.Describe(ch)
+	slowQueriesInfo.Describe(ch)
+	slowQueriesDurationTotal.Describe(ch)
+	slowQueriesKeysExaminedTotal.Describe(ch)
+	slowQueriesDocsExaminedTotal.Describe(ch)
+	slowQueriesNreturnedTotal.Describe(ch)
 }
 
 func (d *profileCollector) Collect(ch chan<- prometheus.Metric) {
-	d.base.Collect(ch)
+	d.collect()
+	slowQueriesCountTotal.Collect(ch)
+	slowQueriesInfo.Collect(ch)
+	slowQueriesDurationTotal.Collect(ch)
+	slowQueriesKeysExaminedTotal.Collect(ch)
+	slowQueriesDocsExaminedTotal.Collect(ch)
+	slowQueriesNreturnedTotal.Collect(ch)
 }
 
-// profileDocument represents a MongoDB profile document structure.
-type profileDocument struct {
-	TS                 primitive.DateTime `bson:"ts"`
-	T                  primitive.DateTime `bson:"t,omitempty"`
-	Op                 string             `bson:"op"`
-	NS                 string             `bson:"ns"`
-	QueryHash          string             `bson:"queryHash,omitempty"`
-	Command            primitive.M        `bson:"command,omitempty"`
-	OriginatingCommand primitive.M        `bson:"originatingCommand,omitempty"`
-	QueryPlanning      *struct {
-		PlanSummary string `bson:"planSummary,omitempty"`
-	} `bson:"queryPlanning,omitempty"`
-	ExecutionStats *struct {
-		TotalExaminedDocs int64 `bson:"totalExaminedDocs,omitempty"`
-		TotalKeysExamined int64 `bson:"totalKeysExamined,omitempty"`
-		NReturned         int64 `bson:"nReturned,omitempty"`
-	} `bson:"executionStats,omitempty"`
-	KeysExamined   int64  `bson:"keysExamined,omitempty"`
-	DocsExamined   int64  `bson:"docsExamined,omitempty"`
-	NReturned      int64  `bson:"nreturned,omitempty"`
-	Millis         int64  `bson:"millis"`
-	QueryFramework string `bson:"queryFramework,omitempty"`
-}
-
-// normalizeQueryShape sanitizes and normalizes MongoDB query shapes.
-func (d *profileCollector) normalizeQueryShape(command primitive.M) string {
-	if command == nil {
-		return ""
+func (d *profileCollector) collect() {
+	client := d.base.client
+	if client == nil {
+		return
 	}
 
-	// Convert to JSON-like string and sanitize
-	shape := d.sanitizeQuery(command)
+	// Calculate time window (matching Python implementation)
+	endTime := time.Now()
+	startTime := endTime.Add(-time.Duration(d.profiletimets) * time.Second)
 
-	// Truncate if too long
-	if len(shape) > d.maxStringSize {
-		shape = shape[:d.maxStringSize-3] + "..."
+	// Get list of databases
+	databases, err := client.ListDatabaseNames(d.ctx, bson.M{})
+	if err != nil {
+		d.base.logger.Debug("Failed to list databases", "error", err)
+		return
 	}
 
-	return shape
+	// Remove excluded databases (matching Python implementation)
+	excludedDbs := map[string]bool{"local": true, "admin": true, "config": true, "test": true}
+	var validDbs []string
+	for _, dbName := range databases {
+		if !excludedDbs[dbName] {
+			validDbs = append(validDbs, dbName)
+		}
+	}
+
+	// Clear info metric every 300 seconds (matching Python implementation)
+	d.mutex.Lock()
+	if time.Since(d.lastInfoClear) >= d.infoClearInterval {
+		slowQueriesInfo.Reset()
+		d.lastInfoClear = time.Now()
+	}
+	d.mutex.Unlock()
+
+	// Process each valid database
+	for _, dbName := range validDbs {
+		db := client.Database(dbName)
+
+		// Get unique namespaces within time window
+		nsValues, err := d.getNSValues(db, startTime, endTime)
+		if err != nil {
+			d.base.logger.Debug("Failed to get ns values", "database", dbName, "error", err)
+			continue
+		}
+
+		for _, ns := range nsValues {
+			// Get unique query hashes for this namespace within time window
+			queryHashes, err := d.getQueryHashValues(db, ns, startTime, endTime)
+			if err != nil {
+				d.base.logger.Debug("Failed to get query hashes", "database", dbName, "ns", ns, "error", err)
+				continue
+			}
+
+			for _, queryHash := range queryHashes {
+				// Get count for this (db, ns, query_hash) combination
+				count, err := d.getSlowQueriesCount(db, ns, queryHash, startTime, endTime)
+				if err != nil {
+					d.base.logger.Debug("Failed to get count", "database", dbName, "ns", ns, "query_hash", queryHash, "error", err)
+					continue
+				}
+
+				// Update count metric
+				slowQueriesCountTotal.WithLabelValues(dbName, ns, queryHash).Add(float64(count))
+
+				// Get sum values for this (db, ns, query_hash) combination
+				sums, err := d.getSlowQueriesValueSum(db, ns, queryHash, startTime, endTime)
+				if err != nil {
+					d.base.logger.Debug("Failed to get sums", "database", dbName, "ns", ns, "query_hash", queryHash, "error", err)
+					continue
+				}
+
+				// Update sum metrics
+				slowQueriesDurationTotal.WithLabelValues(dbName, ns, queryHash).Add(float64(sums["millis"]))
+				slowQueriesKeysExaminedTotal.WithLabelValues(dbName, ns, queryHash).Add(float64(sums["keysExamined"]))
+				slowQueriesDocsExaminedTotal.WithLabelValues(dbName, ns, queryHash).Add(float64(sums["docsExamined"]))
+				slowQueriesNreturnedTotal.WithLabelValues(dbName, ns, queryHash).Add(float64(sums["nreturned"]))
+
+				// Get query info for info metric
+				queryInfo, err := d.getQueryInfoValues(db, ns, queryHash, startTime, endTime)
+				if err != nil {
+					d.base.logger.Debug("Failed to get query info", "database", dbName, "ns", ns, "query_hash", queryHash, "error", err)
+					continue
+				}
+
+				// Update info metric if query shape is not empty
+				if queryInfo.QueryShape != "" {
+					slowQueriesInfo.WithLabelValues(
+						dbName,
+						ns,
+						queryHash,
+						d.truncateString(queryInfo.QueryShape),
+						queryInfo.QueryFramework,
+						queryInfo.Op,
+						d.truncateString(queryInfo.PlanSummary),
+					).Set(1)
+				}
+			}
+		}
+	}
 }
 
-// sanitizeQuery recursively sanitizes query values.
-func (d *profileCollector) sanitizeQuery(v interface{}) string {
+// getNSValues gets unique ns values within time window (matching Python implementation)
+func (d *profileCollector) getNSValues(db *mongo.Database, startTime, endTime time.Time) ([]string, error) {
+	collection := db.Collection("system.profile")
+
+	filter := bson.M{
+		"ts": bson.M{
+			"$gte": primitive.NewDateTimeFromTime(startTime),
+			"$lt":  primitive.NewDateTimeFromTime(endTime),
+		},
+	}
+
+	values, err := collection.Distinct(d.ctx, "ns", filter)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []string
+	for _, val := range values {
+		if str, ok := val.(string); ok {
+			result = append(result, str)
+		}
+	}
+
+	return result, nil
+}
+
+// getQueryHashValues gets unique queryHash values for a namespace within time window
+func (d *profileCollector) getQueryHashValues(db *mongo.Database, ns string, startTime, endTime time.Time) ([]string, error) {
+	collection := db.Collection("system.profile")
+
+	filter := bson.M{
+		"ns": ns,
+		"ts": bson.M{
+			"$gte": primitive.NewDateTimeFromTime(startTime),
+			"$lt":  primitive.NewDateTimeFromTime(endTime),
+		},
+	}
+
+	values, err := collection.Distinct(d.ctx, "queryHash", filter)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []string
+	for _, val := range values {
+		if str, ok := val.(string); ok {
+			result = append(result, str)
+		}
+	}
+
+	return result, nil
+}
+
+// getSlowQueriesCount gets count of documents for (db, ns, query_hash) within time window
+func (d *profileCollector) getSlowQueriesCount(db *mongo.Database, ns, queryHash string, startTime, endTime time.Time) (int64, error) {
+	collection := db.Collection("system.profile")
+
+	filter := bson.M{
+		"queryHash": queryHash,
+		"ns":        ns,
+		"ts": bson.M{
+			"$gte": primitive.NewDateTimeFromTime(startTime),
+			"$lt":  primitive.NewDateTimeFromTime(endTime),
+		},
+	}
+
+	return collection.CountDocuments(d.ctx, filter)
+}
+
+// getSlowQueriesValueSum gets sum of specific fields within time window
+func (d *profileCollector) getSlowQueriesValueSum(db *mongo.Database, ns, queryHash string, startTime, endTime time.Time) (map[string]int64, error) {
+	collection := db.Collection("system.profile")
+
+	pipeline := []bson.M{
+		{
+			"$match": bson.M{
+				"queryHash": queryHash,
+				"ns":        ns,
+				"ts": bson.M{
+					"$gte": primitive.NewDateTimeFromTime(startTime),
+					"$lt":  primitive.NewDateTimeFromTime(endTime),
+				},
+			},
+		},
+		{
+			"$group": bson.M{
+				"_id":          nil,
+				"millis":       bson.M{"$sum": "$millis"},
+				"keysExamined": bson.M{"$sum": "$keysExamined"},
+				"docsExamined": bson.M{"$sum": "$docsExamined"},
+				"nreturned":    bson.M{"$sum": "$nreturned"},
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(d.ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(d.ctx)
+
+	result := map[string]int64{
+		"millis":       0,
+		"keysExamined": 0,
+		"docsExamined": 0,
+		"nreturned":    0,
+	}
+
+	if cursor.Next(d.ctx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, err
+		}
+
+		if millis, ok := doc["millis"]; ok {
+			if val, ok := millis.(int64); ok {
+				result["millis"] = val
+			} else if val, ok := millis.(int32); ok {
+				result["millis"] = int64(val)
+			}
+		}
+		if keysExamined, ok := doc["keysExamined"]; ok {
+			if val, ok := keysExamined.(int64); ok {
+				result["keysExamined"] = val
+			} else if val, ok := keysExamined.(int32); ok {
+				result["keysExamined"] = int64(val)
+			}
+		}
+		if docsExamined, ok := doc["docsExamined"]; ok {
+			if val, ok := docsExamined.(int64); ok {
+				result["docsExamined"] = val
+			} else if val, ok := docsExamined.(int32); ok {
+				result["docsExamined"] = int64(val)
+			}
+		}
+		if nreturned, ok := doc["nreturned"]; ok {
+			if val, ok := nreturned.(int64); ok {
+				result["nreturned"] = val
+			} else if val, ok := nreturned.(int32); ok {
+				result["nreturned"] = int64(val)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+type QueryInfo struct {
+	QueryShape     string
+	QueryFramework string
+	Op             string
+	PlanSummary    string
+}
+
+// getQueryInfoValues gets query information for info metric (matching Python implementation)
+func (d *profileCollector) getQueryInfoValues(db *mongo.Database, ns, queryHash string, startTime, endTime time.Time) (*QueryInfo, error) {
+	collection := db.Collection("system.profile")
+
+	filter := bson.M{
+		"queryHash": queryHash,
+		"ns":        ns,
+		"ts": bson.M{
+			"$gte": primitive.NewDateTimeFromTime(startTime),
+			"$lt":  primitive.NewDateTimeFromTime(endTime),
+		},
+		"command.getMore": bson.M{"$exists": false},
+		"command.explain": bson.M{"$exists": false},
+	}
+
+	var doc bson.M
+	err := collection.FindOne(d.ctx, filter).Decode(&doc)
+	if err != nil {
+		return &QueryInfo{}, nil // Return empty if not found
+	}
+
+	info := &QueryInfo{}
+
+	// Extract command and create query shape
+	if command, ok := doc["command"].(bson.M); ok {
+		info.QueryShape = d.createQueryShape(command)
+	}
+
+	// Extract other fields
+	if queryFramework, ok := doc["queryFramework"].(string); ok {
+		info.QueryFramework = queryFramework
+	}
+	if op, ok := doc["op"].(string); ok {
+		info.Op = op
+	}
+	if planSummary, ok := doc["planSummary"].(string); ok {
+		info.PlanSummary = planSummary
+	}
+
+	return info, nil
+}
+
+// createQueryShape creates a normalized query shape (matching Python implementation)
+func (d *profileCollector) createQueryShape(command bson.M) string {
+	normalized := d.removeKeysAndReplace(command, keysToRemove, "?")
+	return d.bsonToString(normalized)
+}
+
+// removeKeysAndReplace removes keys and replaces values (matching Python implementation)
+func (d *profileCollector) removeKeysAndReplace(query interface{}, keysToRemove []string, replaceValue string) interface{} {
+	switch v := query.(type) {
+	case bson.M:
+		result := make(bson.M)
+		for key, value := range v {
+			// Skip keys in removal list
+			skip := false
+			for _, keyToRemove := range keysToRemove {
+				if key == keyToRemove {
+					skip = true
+					break
+				}
+			}
+			if !skip {
+				result[key] = d.removeKeysAndReplace(value, keysToRemove, replaceValue)
+			}
+		}
+		return result
+	case bson.A:
+		result := make(bson.A, len(v))
+		for i, item := range v {
+			result[i] = d.removeKeysAndReplace(item, keysToRemove, replaceValue)
+		}
+		return result
+	case []interface{}:
+		result := make([]interface{}, len(v))
+		for i, item := range v {
+			result[i] = d.removeKeysAndReplace(item, keysToRemove, replaceValue)
+		}
+		return result
+	default:
+		return replaceValue
+	}
+}
+
+// bsonToString converts BSON to string representation
+func (d *profileCollector) bsonToString(v interface{}) string {
 	switch val := v.(type) {
-	case primitive.M:
+	case bson.M:
 		var parts []string
 		for k, v := range val {
-			parts = append(parts, fmt.Sprintf("%s: %s", k, d.sanitizeQuery(v)))
+			parts = append(parts, k+": "+d.bsonToString(v))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
-	case primitive.A:
+	case bson.A:
 		var parts []string
 		for _, item := range val {
-			parts = append(parts, d.sanitizeQuery(item))
+			parts = append(parts, d.bsonToString(item))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case []interface{}:
+		var parts []string
+		for _, item := range val {
+			parts = append(parts, d.bsonToString(item))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case string:
-		return "?"
-	case int, int32, int64, float32, float64:
-		return "?"
-	case primitive.ObjectID:
-		return "ObjectId(?)"
-	case primitive.DateTime:
-		return "ISODate(?)"
-	case bool:
-		return strconv.FormatBool(val)
+		return "\"" + val + "\""
 	default:
 		return "?"
 	}
 }
 
-// truncateString truncates a string to maxSize if it's longer.
-func (d *profileCollector) truncateString(s string, maxSize int) string {
-	if maxSize <= 0 {
-		maxSize = d.maxStringSize
+// truncateString truncates string to maxStringSize (matching Python implementation)
+func (d *profileCollector) truncateString(s string) string {
+	if len(s) > d.maxStringSize {
+		return s[:d.maxStringSize]
 	}
-	if len(s) <= maxSize {
-		return s
-	}
-	return s[:maxSize-3] + "..."
-}
-
-// extractDatabaseAndCollection splits namespace into database and collection.
-func extractDatabaseAndCollection(ns string) (string, string) {
-	parts := strings.SplitN(ns, ".", 2)
-	if len(parts) < 2 {
-		return parts[0], ""
-	}
-	return parts[0], parts[1]
-}
-
-func (d *profileCollector) collect(ch chan<- prometheus.Metric) {
-	defer measureCollectTime(ch, "mongodb", "profile")()
-
-	logger := d.base.logger
-	client := d.base.client
-	timeScrape := d.profiletimets
-
-	databases, err := databases(d.ctx, client, nil, nil)
-	if err != nil {
-		logger.Warn("cannot get databases", "error", err)
-		return
-	}
-
-	// Time threshold for profile document filtering
-	ts := primitive.NewDateTimeFromTime(time.Now().Add(-time.Duration(time.Second * time.Duration(timeScrape))))
-
-	// Aggregated metrics by query signature
-	queryMetrics := make(map[string]*queryAggregation)
-
-	// Legacy metric for backward compatibility
-	legacyCountByDB := make(map[string]int64)
-
-	// Process each database
-	for _, db := range databases {
-		profileCollection := client.Database(db).Collection("system.profile")
-
-		// Query profile documents
-		filter := bson.M{"ts": bson.M{"$gte": ts}}
-		cursor, err := profileCollection.Find(d.ctx, filter)
-		if err != nil {
-			logger.Warn("cannot query profile collection", "database", db, "error", err)
-			continue
-		}
-
-		var docs []profileDocument
-		if err := cursor.All(d.ctx, &docs); err != nil {
-			logger.Warn("cannot decode profile documents", "database", db, "error", err)
-			cursor.Close(d.ctx)
-			continue
-		}
-		cursor.Close(d.ctx)
-
-		// Process each profile document
-		for _, doc := range docs {
-			database, collection := extractDatabaseAndCollection(doc.NS)
-			if database == "" {
-				database = db
-			}
-
-			// Create query signature for aggregation
-			signature := d.createQuerySignature(doc, database)
-
-			// Aggregate metrics
-			if agg, exists := queryMetrics[signature]; exists {
-				agg.count++
-				agg.totalDuration += doc.Millis
-				agg.totalKeysExamined += d.getKeysExamined(doc)
-				agg.totalDocsExamined += d.getDocsExamined(doc)
-				agg.totalNReturned += d.getNReturned(doc)
-			} else {
-				queryMetrics[signature] = &queryAggregation{
-					labels:            d.createLabels(doc, database, collection),
-					count:             1,
-					totalDuration:     doc.Millis,
-					totalKeysExamined: d.getKeysExamined(doc),
-					totalDocsExamined: d.getDocsExamined(doc),
-					totalNReturned:    d.getNReturned(doc),
-				}
-			}
-
-			// Legacy count by database
-			legacyCountByDB[database]++
-		}
-	}
-
-	// Generate enhanced metrics
-	d.generateEnhancedMetrics(ch, queryMetrics)
-
-	// Generate legacy metrics for backward compatibility
-	d.generateLegacyMetrics(ch, legacyCountByDB)
-}
-
-// queryAggregation holds aggregated metrics for a query signature.
-type queryAggregation struct {
-	labels            map[string]string
-	count             int64
-	totalDuration     int64
-	totalKeysExamined int64
-	totalDocsExamined int64
-	totalNReturned    int64
-}
-
-// createQuerySignature creates a unique signature for query aggregation.
-func (d *profileCollector) createQuerySignature(doc profileDocument, database string) string {
-	return fmt.Sprintf("%s|%s|%s|%s",
-		database,
-		doc.NS,
-		doc.Op,
-		doc.QueryHash)
-}
-
-// createLabels creates labels for metrics based on profile document.
-func (d *profileCollector) createLabels(doc profileDocument, database, collection string) map[string]string {
-	labels := d.topologyInfo.baseLabels()
-	labels["database"] = database
-	labels["ns"] = doc.NS
-	labels["op_type"] = doc.Op
-
-	if doc.QueryHash != "" {
-		labels["query_hash"] = doc.QueryHash
-	}
-
-	if doc.QueryFramework != "" {
-		labels["query_framework"] = doc.QueryFramework
-	} else {
-		labels["query_framework"] = "classic"
-	}
-
-	// Add plan summary if available
-	if doc.QueryPlanning != nil && doc.QueryPlanning.PlanSummary != "" {
-		labels["plan_summary"] = d.truncateString(doc.QueryPlanning.PlanSummary, d.maxStringSize)
-	}
-
-	// Add query shape
-	var command primitive.M
-	if doc.Command != nil {
-		command = doc.Command
-	} else if doc.OriginatingCommand != nil {
-		command = doc.OriginatingCommand
-	}
-
-	if command != nil {
-		queryShape := d.normalizeQueryShape(command)
-		if queryShape != "" {
-			labels["query_shape"] = queryShape
-		}
-	}
-
-	return labels
-}
-
-// Helper functions to extract metrics from profile document.
-func (d *profileCollector) getKeysExamined(doc profileDocument) int64 {
-	if doc.ExecutionStats != nil && doc.ExecutionStats.TotalKeysExamined > 0 {
-		return doc.ExecutionStats.TotalKeysExamined
-	}
-	return doc.KeysExamined
-}
-
-func (d *profileCollector) getDocsExamined(doc profileDocument) int64 {
-	if doc.ExecutionStats != nil && doc.ExecutionStats.TotalExaminedDocs > 0 {
-		return doc.ExecutionStats.TotalExaminedDocs
-	}
-	return doc.DocsExamined
-}
-
-func (d *profileCollector) getNReturned(doc profileDocument) int64 {
-	if doc.ExecutionStats != nil && doc.ExecutionStats.NReturned > 0 {
-		return doc.ExecutionStats.NReturned
-	}
-	return doc.NReturned
-}
-
-// generateEnhancedMetrics creates the new comprehensive metrics.
-func (d *profileCollector) generateEnhancedMetrics(ch chan<- prometheus.Metric, queryMetrics map[string]*queryAggregation) {
-	for _, agg := range queryMetrics {
-		// Counter metrics
-		d.createCounterMetric(ch, "mongodb_profile_slow_queries_count_total",
-			"Total number of slow queries by query shape", agg.labels, float64(agg.count))
-
-		d.createCounterMetric(ch, "mongodb_profile_slow_queries_duration_total",
-			"Total execution time of slow queries in milliseconds", agg.labels, float64(agg.totalDuration))
-
-		d.createCounterMetric(ch, "mongodb_profile_slow_queries_keys_examined_total",
-			"Total number of keys examined by slow queries", agg.labels, float64(agg.totalKeysExamined))
-
-		d.createCounterMetric(ch, "mongodb_profile_slow_queries_docs_examined_total",
-			"Total number of documents examined by slow queries", agg.labels, float64(agg.totalDocsExamined))
-
-		d.createCounterMetric(ch, "mongodb_profile_slow_queries_nreturned_total",
-			"Total number of documents returned by slow queries", agg.labels, float64(agg.totalNReturned))
-
-		// Info gauge metric
-		d.createGaugeMetric(ch, "mongodb_profile_slow_queries_info",
-			"Query metadata and shape information", agg.labels, 1.0)
-	}
-}
-
-// generateLegacyMetrics creates backward-compatible metrics.
-func (d *profileCollector) generateLegacyMetrics(ch chan<- prometheus.Metric, legacyCountByDB map[string]int64) {
-	for db, count := range legacyCountByDB {
-		labels := d.topologyInfo.baseLabels()
-		labels["database"] = db
-
-		m := primitive.M{"count": count}
-		for _, metric := range makeMetrics("profile_slow_query", m, labels, d.compatibleMode) {
-			ch <- metric
-		}
-	}
-}
-
-// createCounterMetric creates a counter metric.
-func (d *profileCollector) createCounterMetric(ch chan<- prometheus.Metric, name, help string, labels map[string]string, value float64) {
-	labelNames := make([]string, 0, len(labels))
-	labelValues := make([]string, 0, len(labels))
-
-	for k, v := range labels {
-		labelNames = append(labelNames, k)
-		labelValues = append(labelValues, v)
-	}
-
-	desc := prometheus.NewDesc(name, help, labelNames, nil)
-	metric := prometheus.MustNewConstMetric(desc, prometheus.CounterValue, value, labelValues...)
-	ch <- metric
-}
-
-// createGaugeMetric creates a gauge metric.
-func (d *profileCollector) createGaugeMetric(ch chan<- prometheus.Metric, name, help string, labels map[string]string, value float64) {
-	labelNames := make([]string, 0, len(labels))
-	labelValues := make([]string, 0, len(labels))
-
-	for k, v := range labels {
-		labelNames = append(labelNames, k)
-		labelValues = append(labelValues, v)
-	}
-
-	desc := prometheus.NewDesc(name, help, labelNames, nil)
-	metric := prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, labelValues...)
-	ch <- metric
+	return s
 }

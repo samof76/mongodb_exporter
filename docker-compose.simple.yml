@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  mongodb:
+    container_name: "mongodb-test"
+    image: mongo:6.0
+    ports:
+      - "27017:27017"
+    command: mongod --port 27017 --oplogSize 16 --bind_ip 0.0.0.0
+    environment:
+      - MONGO_INITDB_DATABASE=testdb
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
