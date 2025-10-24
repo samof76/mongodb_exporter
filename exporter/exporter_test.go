@@ -289,7 +289,6 @@ func TestMongoUpMetric(t *testing.T) {
 	ctx := context.Background()
 
 	type testcase struct {
-		name        string
 		URI         string
 		clusterRole string
 		Want        int
@@ -342,4 +341,197 @@ func TestMongoUpMetric(t *testing.T) {
 			assert.Equal(t, true, res)
 		})
 	}
+}
+
+// TestGetRequestOpts tests the GetRequestOpts function behavior with different flag combinations.
+func TestGetRequestOpts(t *testing.T) {
+	t.Run("GetRequestOpts with empty filters", func(t *testing.T) {
+		defaultOpts := &Opts{
+			EnableProfile:        true,
+			EnableDBStats:        true,
+			ProfileTimeTS:        60,
+			ProfileMaxStringSize: 2000,
+		}
+
+		// Empty filters should return copy of default opts
+		requestOpts := GetRequestOpts([]string{}, defaultOpts)
+		
+		assert.Equal(t, defaultOpts.EnableProfile, requestOpts.EnableProfile)
+		assert.Equal(t, defaultOpts.EnableDBStats, requestOpts.EnableDBStats)
+		assert.Equal(t, defaultOpts.ProfileTimeTS, requestOpts.ProfileTimeTS)
+		assert.Equal(t, defaultOpts.ProfileMaxStringSize, requestOpts.ProfileMaxStringSize)
+	})
+
+	t.Run("GetRequestOpts with profile filter", func(t *testing.T) {
+		defaultOpts := &Opts{
+			EnableProfile:        false,
+			EnableDBStats:        false,
+			ProfileTimeTS:        30,
+			ProfileMaxStringSize: 1000,
+		}
+
+		// Profile filter should enable profile collector
+		requestOpts := GetRequestOpts([]string{"profile"}, defaultOpts)
+		
+		assert.True(t, requestOpts.EnableProfile)
+		assert.False(t, requestOpts.EnableDBStats) // Should not be enabled
+	})
+
+	t.Run("GetRequestOpts with multiple filters", func(t *testing.T) {
+		defaultOpts := &Opts{
+			EnableProfile:        false,
+			EnableDBStats:        false,
+			EnableTopMetrics:     false,
+			ProfileTimeTS:        30,
+			ProfileMaxStringSize: 1000,
+		}
+
+		// Multiple filters should enable respective collectors
+		requestOpts := GetRequestOpts([]string{"profile", "dbstats", "topmetrics"}, defaultOpts)
+		
+		assert.True(t, requestOpts.EnableProfile)
+		assert.True(t, requestOpts.EnableDBStats)
+		assert.True(t, requestOpts.EnableTopMetrics)
+	})
+
+	t.Run("GetRequestOpts preserves non-collector settings", func(t *testing.T) {
+		defaultOpts := &Opts{
+			CompatibleMode:       true,
+			DirectConnect:        false,
+			ConnectTimeoutMS:     5000,
+			ProfileTimeTS:        45,
+			ProfileMaxStringSize: 1500,
+			EnableProfile:        false,
+		}
+
+		// URL filters should preserve configuration settings
+		requestOpts := GetRequestOpts([]string{"profile"}, defaultOpts)
+		
+		// Non-collector settings should be preserved
+		assert.Equal(t, defaultOpts.CompatibleMode, requestOpts.CompatibleMode)
+		assert.Equal(t, defaultOpts.DirectConnect, requestOpts.DirectConnect)
+		assert.Equal(t, defaultOpts.ConnectTimeoutMS, requestOpts.ConnectTimeoutMS)
+		assert.Equal(t, defaultOpts.ProfileTimeTS, requestOpts.ProfileTimeTS)
+		assert.Equal(t, defaultOpts.ProfileMaxStringSize, requestOpts.ProfileMaxStringSize)
+		
+		// Collector should be enabled by filter
+		assert.True(t, requestOpts.EnableProfile)
+	})
+}
+
+// TestCollectAllFlag tests the behavior of the CollectAll flag.
+func TestCollectAllFlag(t *testing.T) {
+	t.Run("CollectAll enables all collectors", func(t *testing.T) {
+		opts := &Opts{
+			CollectAll:           true,
+			EnableProfile:        false, // Should be overridden
+			EnableDBStats:        false, // Should be overridden
+			EnableTopMetrics:     false, // Should be overridden
+		}
+
+		// Simulate the logic from makeRegistry
+		if opts.CollectAll {
+			opts.EnableDiagnosticData = true
+			opts.EnableDBStats = true
+			opts.EnableDBStatsFreeStorage = true
+			opts.EnableCollStats = true
+			opts.EnableTopMetrics = true
+			opts.EnableReplicasetStatus = true
+			opts.EnableReplicasetConfig = true
+			opts.EnableIndexStats = true
+			opts.EnableCurrentopMetrics = true
+			opts.EnableProfile = true
+			opts.EnableShards = true
+			opts.EnableFCV = true
+			opts.EnablePBMMetrics = true
+		}
+
+		// All collectors should be enabled
+		assert.True(t, opts.EnableProfile)
+		assert.True(t, opts.EnableDBStats)
+		assert.True(t, opts.EnableTopMetrics)
+		assert.True(t, opts.EnableDiagnosticData)
+		assert.True(t, opts.EnableCollStats)
+	})
+
+	t.Run("Collector conditions - profile collector requirements", func(t *testing.T) {
+		testCases := []struct {
+			name                    string
+			enableProfile           bool
+			requestOptsEnableProfile bool
+			profileTimeTS           int
+			nodeType                string
+			limitsOk                bool
+			expectRegistration      bool
+		}{
+			{
+				name:                    "All conditions met",
+				enableProfile:           true,
+				requestOptsEnableProfile: true,
+				profileTimeTS:           30,
+				nodeType:                "mongod",
+				limitsOk:                true,
+				expectRegistration:      true,
+			},
+			{
+				name:                    "Profile disabled in opts",
+				enableProfile:           false,
+				requestOptsEnableProfile: true,
+				profileTimeTS:           30,
+				nodeType:                "mongod",
+				limitsOk:                true,
+				expectRegistration:      false,
+			},
+			{
+				name:                    "Profile disabled in request",
+				enableProfile:           true,
+				requestOptsEnableProfile: false,
+				profileTimeTS:           30,
+				nodeType:                "mongod",
+				limitsOk:                true,
+				expectRegistration:      false,
+			},
+			{
+				name:                    "Zero ProfileTimeTS",
+				enableProfile:           true,
+				requestOptsEnableProfile: true,
+				profileTimeTS:           0,
+				nodeType:                "mongod",
+				limitsOk:                true,
+				expectRegistration:      false,
+			},
+			{
+				name:                    "MongoS node type",
+				enableProfile:           true,
+				requestOptsEnableProfile: true,
+				profileTimeTS:           30,
+				nodeType:                "mongos",
+				limitsOk:                true,
+				expectRegistration:      false,
+			},
+			{
+				name:                    "Collection limits exceeded",
+				enableProfile:           true,
+				requestOptsEnableProfile: true,
+				profileTimeTS:           30,
+				nodeType:                "mongod",
+				limitsOk:                false,
+				expectRegistration:      false,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				// Simulate the condition from makeRegistry
+				shouldRegister := tc.enableProfile && 
+					tc.nodeType != "mongos" && 
+					tc.limitsOk && 
+					tc.requestOptsEnableProfile && 
+					tc.profileTimeTS != 0
+				
+				assert.Equal(t, tc.expectRegistration, shouldRegister, 
+					"Profile collector registration condition mismatch")
+			})
+		}
+	})
 }

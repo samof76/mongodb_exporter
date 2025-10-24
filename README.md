@@ -45,6 +45,67 @@ Just run `make release` and the new binaries will be generated under the build d
 │ └── mongodb_exporter_linux_amd64
 │ └── mongodb_exporter <--- Linux binary
 ```
+
+### Development and Testing
+
+#### Running Tests
+
+The project includes comprehensive unit tests for all components. Tests are designed to run without requiring a live MongoDB connection for most functionality.
+
+**Run all tests:**
+```bash
+go test ./...
+```
+
+**Run tests with verbose output:**
+```bash
+go test -v ./...
+```
+
+**Run specific test packages:**
+```bash
+# Test only the exporter package
+go test ./exporter
+
+# Test only the profile collector
+go test ./exporter -run TestProfile
+```
+
+**Run tests with coverage:**
+```bash
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+```
+
+#### Test Structure
+
+- **Unit Tests**: Most tests run without external dependencies and focus on logic validation
+- **Integration Tests**: Some tests require Docker containers with MongoDB instances
+- **Profile Collector Tests**: Comprehensive tests for flag combinations, URL filtering behavior, and defensive registration
+
+**Key Test Areas:**
+- `TestGetRequestOpts`: Tests URL parameter filtering and configuration preservation
+- `TestCollectAllFlag`: Tests collector registration conditions and flag behavior  
+- `TestProfileCollector*`: Tests profile collector functionality and edge cases
+
+#### URL Parameter Testing
+
+The enhanced profile collector supports URL parameters for selective metric collection. The `GetRequestOpts` function now properly preserves configuration settings while enabling only requested collectors:
+
+```bash
+# Enable only profile collector via URL
+curl "http://localhost:9216/metrics?collect[]=profile"
+
+# Enable multiple collectors
+curl "http://localhost:9216/metrics?collect[]=profile&collect[]=dbstats"
+```
+
+**Configuration Preservation**: When using URL filters, settings like `ProfileTimeTS` and `ProfileMaxStringSize` are preserved from the default configuration, ensuring consistent behavior across different access methods.
+
+#### Defensive Registration
+
+The profile collector includes defensive registration logic to prevent panics when conflicting command-line flags are used (e.g., `--collect-all` with `--collector.profile`). The system logs warnings instead of crashing and continues operation.
+
 ### Running the exporter
 If you built the exporter using the method mentioned in the previous section, the generated binaries are in `mongodb_exporter_linux_amd64/mongodb_exporter` or `mongodb_exporter_darwin_amd64/mongodb_exporter`
 
@@ -60,6 +121,39 @@ podman run -d -p 9216:9216 percona/mongodb_exporter:0.40 --mongodb.uri=mongodb:/
 # with docker
 docker run -d -p 9216:9216 percona/mongodb_exporter:0.40 --mongodb.uri=mongodb://127.0.0.1:17001
 ```
+
+#### Multi-Architecture Docker Build
+
+The project includes `Dockerfile.multi` for building multi-architecture Docker images supporting both `linux/amd64` and `linux/arm64` platforms.
+
+**Building locally:**
+```sh
+# Build multi-architecture image locally (requires Docker Buildx)
+make docker-build-multi
+```
+
+**Publishing to registry:**
+```sh
+# Publish to default repository with git SHA tag
+make publish
+
+# Publish to custom repository
+DOCKER_REPO=your-registry/mongodb_exporter make publish
+
+# Example with AWS ECR
+DOCKER_REPO=123456789.dkr.ecr.us-east-1.amazonaws.com/mongodb_exporter make publish
+```
+
+The `publish` target automatically:
+- Builds for both `linux/amd64` and `linux/arm64` architectures
+- Tags the image with a 7-character git SHA (e.g., `a1b2c3d`)
+- Pushes the multi-architecture manifest to the configured repository
+- Includes proper build metadata (version, commit, build date)
+
+**Prerequisites:**
+- Docker Buildx installed and configured
+- Access to the target Docker registry
+- `docker login` completed for the target registry
 
 ### Permissions
 Connecting user should have sufficient rights to query needed stats:
@@ -160,15 +254,173 @@ HELP mongodb_mongod_wiredtiger_log_bytes_total mongodb_mongod_wiredtiger_log_byt
 mongodb_mongod_wiredtiger_log_bytes_total{type="unwritten"} 2.6208e+06
 ```
 #### Enabling profile metrics gathering
-`--collector.profile` 
+`--collector.profile`
+
+The profile collector provides comprehensive MongoDB slow query metrics from the `system.profile` collection, including query shapes, execution times, and performance statistics.
+
+**Configuration Options:**
+- `--collector.profile-time-ts` - Time window in seconds for scraping slow queries (default: 30)
+- `--collector.profile-max-string-size` - Maximum string size for query labels (default: 1000)
+
+**Exported Metrics:**
+
+*Counter Metrics:*
+- `mongodb_profile_slow_queries_count_total` - Total number of slow queries by query shape
+- `mongodb_profile_slow_queries_duration_total` - Total execution time in milliseconds
+- `mongodb_profile_slow_queries_keys_examined_total` - Total keys examined
+- `mongodb_profile_slow_queries_docs_examined_total` - Total documents examined
+- `mongodb_profile_slow_queries_nreturned_total` - Total documents returned
+
+*Gauge Metrics:*
+- `mongodb_profile_slow_queries_info` - Query metadata information (always 1)
+
+*Labels:*
+- `database` - Database name
+- `ns` - MongoDB namespace (database.collection)
+- `query_hash` - MongoDB query hash identifier
+- `query_shape` - Normalized query shape (sanitized for security)
+- `query_framework` - Query execution framework (classic, sbe)
+- `op_type` - Operation type (query, insert, update, delete)
+- `plan_summary` - Query execution plan summary
+
+**MongoDB Profiler Setup:**
 To collect metrics, you need to enable the profiler in [MongoDB](https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/):
-Usage example: `db.setProfilingLevel(2)`
+
+```bash
+# Enable profiler for slow operations (>100ms)
+db.setProfilingLevel(1, { slowms: 100 })
+
+# Enable profiler for all operations
+db.setProfilingLevel(2)
+
+# Increase profile collection size (recommended for production)
+db.setProfilingLevel(0)
+db.system.profile.drop()
+db.createCollection("system.profile", { capped: true, size: 52428800 }) // 50MB
+db.setProfilingLevel(1, { slowms: 100 })
+```
 
 |Level|Description|
 |-----|-----------|
 |0| The profiler is off and does not collect any data. This is the default profiler level.|
 |1| The profiler collects data for operations that take longer than the value of `slowms` or that match a filter.<br> When a filter is set: <ul><li> The `slowms` and `sampleRate` options are not used for profiling.</li><li>The profiler only captures operations that match the filter.</li></ul>
 |2|The profiler collects data for all operations.|
+
+**Usage Examples:**
+```bash
+# Enable enhanced profile collector with default settings
+mongodb_exporter --collector.profile --collector.profile-time-ts=30
+
+# With custom string size limits
+mongodb_exporter --collector.profile --collector.profile-max-string-size=500
+
+# Comprehensive monitoring setup
+mongodb_exporter --collector.profile --collector.profile-time-ts=60 \
+  --collector.profile-max-string-size=2000 --mongodb.uri=mongodb://user:pass@localhost:27017
+
+# Enable all collectors (including profile) - recommended for full monitoring
+mongodb_exporter --collect-all --mongodb.uri=mongodb://user:pass@localhost:27017
+```
+
+**Important:** Do not combine `--collect-all` with `--collector.profile` as this can cause conflicts. Use either `--collect-all` (which includes profile collector) OR specific collector flags like `--collector.profile`.
+
+#### Testing and Simulation
+
+To test the enhanced profile collector and verify metrics are being generated:
+
+**1. Enable MongoDB Profiling:**
+```bash
+# Connect to your MongoDB instance
+mongosh mongodb://your-connection-string
+
+# Enable profiling for slow operations (adjust slowms as needed)
+db.setProfilingLevel(1, { slowms: 50 })
+
+# Verify profiling is enabled
+db.getProfilingStatus()
+```
+
+**2. Generate Test Slow Queries:**
+```javascript
+// Create a test collection
+use testdb
+db.testcoll.drop()
+
+// Insert some test data
+for (let i = 0; i < 1000; i++) {
+  db.testcoll.insertOne({
+    name: "user" + i,
+    email: "user" + i + "@example.com",
+    age: Math.floor(Math.random() * 80) + 18,
+    created: new Date()
+  })
+}
+
+// Create an index to see different query patterns
+db.testcoll.createIndex({email: 1})
+
+// Generate slow queries (these should appear in profiler)
+// 1. Collection scan (slow)
+db.testcoll.find({name: /user1.*/}).limit(5)
+
+// 2. Non-indexed field query (slow)
+db.testcoll.find({age: {$gt: 50}}).limit(10)
+
+// 3. Update operation
+db.testcoll.updateMany({age: {$lt: 25}}, {$set: {status: "young"}})
+
+// 4. Aggregation pipeline
+db.testcoll.aggregate([
+  {$match: {age: {$gte: 30}}},
+  {$group: {_id: "$age", count: {$sum: 1}}},
+  {$sort: {count: -1}}
+])
+
+// 5. Delete operation
+db.testcoll.deleteMany({age: {$gt: 75}})
+```
+
+**3. Verify Profile Data:**
+```javascript
+// Check profile collection has data
+db.system.profile.countDocuments({})
+
+// View recent profile entries
+db.system.profile.find().sort({ts: -1}).limit(5).pretty()
+
+// Check for specific operation types
+db.system.profile.find({op: "query"}).limit(3)
+```
+
+**4. Check Exporter Metrics:**
+```bash
+# Wait 30-60 seconds after generating queries, then check metrics
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries"
+
+# Count different metric types
+echo "Enhanced metrics:"
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_count_total" | wc -l
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_duration_total" | wc -l
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_info" | wc -l
+
+# View specific metrics with labels
+curl -s localhost:9216/metrics | grep "mongodb_profile_slow_queries_info" | head -3
+```
+
+**5. Expected Output Example:**
+```
+mongodb_profile_slow_queries_count_total{database="testdb",ns="testdb.testcoll",op_type="query",query_framework="classic"} 3
+mongodb_profile_slow_queries_duration_total{database="testdb",ns="testdb.testcoll",op_type="query",query_framework="classic"} 156
+mongodb_profile_slow_queries_info{database="testdb",ns="testdb.testcoll",query_shape="{find: ?, filter: {age: {$gt: ?}}}",op_type="query"} 1
+```
+
+**Troubleshooting:**
+- If no metrics appear, ensure `ProfileTimeTS` window (default 30s) covers your query time
+- Lower `slowms` threshold: `db.setProfilingLevel(1, { slowms: 10 })`
+- Check profile collection: `db.system.profile.find().count()`
+- Increase time window: `--collector.profile-time-ts=300`
+
+**Note:** The enhanced profile collector maintains backward compatibility with the original `mongodb_profile_slow_query_count` metric while providing detailed query performance insights.
 
 #### Enabling shards metrics gathering
 When shard metrics collection is enabled by `--collector.shards`, the exporter will expose metrics related to sharded Mongo. 

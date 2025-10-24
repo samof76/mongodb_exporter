@@ -1,0 +1,51 @@
+# Multi-architecture Dockerfile for mongodb_exporter
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG BUILDPLATFORM
+
+# Build arguments for versioning
+ARG BUILD_DATE
+ARG COMPONENT_VERSION
+ARG PMM_RELEASE_FULLCOMMIT
+ARG COMPONENT_BRANCH
+ARG GOVERSION
+
+# Set working directory
+WORKDIR /src
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates
+
+# Copy go modules files first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary for the target architecture
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -ldflags="-X main.version=${COMPONENT_VERSION} -X main.buildDate=${BUILD_DATE} -X main.commit=${PMM_RELEASE_FULLCOMMIT} -X main.Branch=${COMPONENT_BRANCH} -X main.GoVersion=${GOVERSION} -s -w" \
+    -o mongodb_exporter .
+
+# Final stage - minimal image
+FROM alpine AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM scratch AS final
+# Copy certificates from alpine
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy the binary from builder stage
+COPY --from=builder /src/mongodb_exporter /mongodb_exporter
+
+# Run as non-root user
+USER 65535:65535
+
+# Expose the default port
+EXPOSE 9216
+
+# Set the entrypoint
+ENTRYPOINT ["/mongodb_exporter"]

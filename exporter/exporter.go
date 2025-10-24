@@ -79,6 +79,7 @@ type Opts struct {
 	IndexStatsCollections  []string
 	CurrentOpSlowTime      string
 	ProfileTimeTS          int
+	ProfileMaxStringSize   int
 
 	Logger *slog.Logger
 
@@ -226,8 +227,17 @@ func (e *Exporter) makeRegistry(ctx context.Context, client *mongo.Client, topol
 
 	if e.opts.EnableProfile && nodeType != typeMongos && limitsOk && requestOpts.EnableProfile && e.opts.ProfileTimeTS != 0 {
 		pc := newProfileCollector(ctx, client, e.opts.Logger,
-			e.opts.CompatibleMode, topologyInfo, e.opts.ProfileTimeTS)
-		registry.MustRegister(pc)
+			e.opts.CompatibleMode, topologyInfo, e.opts.ProfileTimeTS, e.opts.ProfileMaxStringSize)
+
+		// Safe registration with error handling for potential conflicts
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					e.logger.Warn("Profile collector registration failed, likely due to duplicate registration from conflicting command line flags. Use either --collect-all OR --collector.profile, not both.", "error", r)
+				}
+			}()
+			registry.MustRegister(pc)
+		}()
 	}
 
 	if e.opts.EnableTopMetrics && nodeType != typeMongos && limitsOk && requestOpts.EnableTopMetrics {
@@ -381,12 +391,27 @@ func (e *Exporter) Handler() http.Handler {
 
 // GetRequestOpts makes exporter.Opts structure from request filters and default options.
 func GetRequestOpts(filters []string, defaultOpts *Opts) Opts {
-	requestOpts := Opts{}
-
 	if len(filters) == 0 {
-		requestOpts = *defaultOpts
+		return *defaultOpts
 	}
 
+	// Start with default options but disable all collectors
+	requestOpts := *defaultOpts
+	requestOpts.EnableDiagnosticData = false
+	requestOpts.EnableDBStats = false
+	requestOpts.EnableDBStatsFreeStorage = false
+	requestOpts.EnableCollStats = false
+	requestOpts.EnableTopMetrics = false
+	requestOpts.EnableReplicasetStatus = false
+	requestOpts.EnableReplicasetConfig = false
+	requestOpts.EnableIndexStats = false
+	requestOpts.EnableCurrentopMetrics = false
+	requestOpts.EnableProfile = false
+	requestOpts.EnableShards = false
+	requestOpts.EnableFCV = false
+	requestOpts.EnablePBMMetrics = false
+
+	// Enable only the requested collectors
 	for _, filter := range filters {
 		switch filter {
 		case "diagnosticdata":
